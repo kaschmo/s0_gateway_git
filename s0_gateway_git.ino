@@ -16,13 +16,17 @@
  //end OTA requirements
  #include <PubSubClient.h>
 
- #define EEPROM_ADDRESS 0
+ #define EEPROM_ADDRESS_V 0
+ #define EEPROM_ADDRESS_Q 2
  
 
  //timer
  int timer_update_state_count;
  int timer_update_state = 60000; //update status via MQTT every minute
  
+ int timer_hour_count;
+ int timer_hour = 3600000;
+
  //pulse counting support
  uint32_t pulse_count_V = 0;
  uint32_t pulse_count_Q = 0;
@@ -33,6 +37,13 @@
  
 uint32_t energy; // in kwh
 uint32_t volume; // in l
+
+uint32_t volume_h=0; //in l/h
+uint32_t volume_h_counter=0;
+
+uint32_t power=0; //in kwh/h
+uint32_t power_counter=0;
+
 
  //MQTT
  WiFiClient espClient;
@@ -114,8 +125,7 @@ uint32_t volume; // in l
     v=message.toInt();
     Serial.println(v);
     //store in EEPROM and set global var
-    EEPROM.put(EEPROM_ADDRESS, volume);
-    EEPROM.commit();
+    EEPROM.put(EEPROM_ADDRESS_V, v);
     volume=v;
   }
   else if (!strcmp(cmnd, "setQ")) {
@@ -125,7 +135,7 @@ uint32_t volume; // in l
     q=message.toInt();
     Serial.println(q);
     //store in EEPROM and set global var
-    //EEPROM.put(EEPROM_ADDRESS, code);
+    EEPROM.put(EEPROM_ADDRESS_Q, q);
     energy=q;
   }
  }
@@ -151,14 +161,25 @@ uint32_t volume; // in l
     char outTopic_status[50];
     char msg[50];
  
+    //dtostrf width = number of character, prec = after decimal point
     strcpy(outTopic_status,outTopic);
-    dtostrf(energy,2,2,msg); 
+    dtostrf(energy,1,0,msg); 
     strcat(outTopic_status,"energy");
     client.publish(outTopic_status, msg);
 
     strcpy(outTopic_status,outTopic);
-    dtostrf(volume,2,2,msg); 
+    dtostrf(volume,1,0,msg); 
     strcat(outTopic_status,"volume");
+    client.publish(outTopic_status, msg);
+
+    strcpy(outTopic_status,outTopic);
+    dtostrf(volume_h,1,0,msg); 
+    strcat(outTopic_status,"volume_h");
+    client.publish(outTopic_status, msg);
+
+    strcpy(outTopic_status,outTopic);
+    dtostrf(power,1,0,msg); 
+    strcat(outTopic_status,"power");
     client.publish(outTopic_status, msg);
  
  }
@@ -188,10 +209,10 @@ uint32_t volume; // in l
    }
  }
 
- //Interrupt Callback Function
- void on_pulse()
+ //Interrupt Callback Function for volume
+ void on_pulse_v()
  { 
-    Serial.println("Interrupt");      
+    //Serial.println("Volume Interrupt");      
     
     // if (!SLEEP_MODE) {
          uint32_t new_int = micros();
@@ -203,8 +224,28 @@ uint32_t volume; // in l
          last_int_V = new_int;
      //}
      pulse_count_V++;
-     Serial.print("Detected new pulse. Count: ");      
+     Serial.print("Volume pulse. Count: ");      
      Serial.print(pulse_count_V);
+     Serial.print(" Interval: ");
+     Serial.println(interval);
+ }
+
+ //Interrupt Callback Function for volume
+ void on_pulse_q()
+ { 
+    //Serial.println("Energy Interrupt");      
+    
+    // if (!SLEEP_MODE) {
+         uint32_t new_int = micros();
+         uint32_t interval = new_int-last_int_Q;
+         if (interval<10000L) { // Sometimes we get interrupt on RISING
+             return;
+         }
+         last_int_Q = new_int;
+     //}
+     pulse_count_Q++;
+     Serial.print("Energy pulse. Count: ");      
+     Serial.print(pulse_count_Q);
      Serial.print(" Interval: ");
      Serial.println(interval);
  }
@@ -218,13 +259,21 @@ uint32_t volume; // in l
  
     //EEPROM
     EEPROM.begin(512); //added 
-    EEPROM.get(EEPROM_ADDRESS, volume);
+    EEPROM.get(EEPROM_ADDRESS_V, volume);
     Serial.print("Fetched volume from EEPROM : "); Serial.println(volume);
+    EEPROM.get(EEPROM_ADDRESS_Q, energy);
+    Serial.print("Fetched energy from EEPROM : "); Serial.println(energy);    
+    //EEPROM must be initlized once! e.g. with MQTT
 
    //interrupt for the S0 Pins
-   pinMode(VOL_PIN, INPUT);
-   attachInterrupt(digitalPinToInterrupt(VOL_PIN), on_pulse, RISING);
+   pinMode(VOL_PIN, INPUT_PULLUP);
+   digitalWrite(VOL_PIN, HIGH);
+   attachInterrupt(digitalPinToInterrupt(VOL_PIN), on_pulse_v, RISING);
  
+   pinMode(Q_PIN, INPUT_PULLUP);
+   digitalWrite(Q_PIN, HIGH);
+   attachInterrupt(digitalPinToInterrupt(Q_PIN), on_pulse_q, RISING);
+
    //WIFI and MQTT
    setup_wifi();                   // Connect to wifi 
    client.setServer(mqtt_server, 1883);
@@ -242,22 +291,45 @@ uint32_t volume; // in l
    httpServer.handleClient(); 
  
    //calculate new V and Q
-   if (pulse_count_V>0) {
-    
+   if (pulse_count_V>0) {    
     volume+=pulse_count_V; //1 pulse = 1l = 0.001m3
-    EEPROM.put(EEPROM_ADDRESS, volume); 
+    volume_h_counter+=pulse_count_V;
+    EEPROM.put(EEPROM_ADDRESS_V, volume); 
     EEPROM.commit();     
     pulse_count_V=0; //resetting pulse count. ATTENTIOn: this could create race condition. maybe use separate variable
+    
     Serial.print("Volume: ");
     Serial.println(volume);
-}
-
+    }
+    
+    if (pulse_count_Q>0) {    
+        energy+=pulse_count_Q; //1 pulse = 1l = 0.001m3
+        power_counter+=pulse_count_Q;
+        EEPROM.put(EEPROM_ADDRESS_Q, energy); 
+        EEPROM.commit();     
+        pulse_count_Q=0; //resetting pulse count. ATTENTIOn: this could create race condition. maybe use separate variable
+        
+        Serial.print("Energy: ");
+        Serial.println(energy);
+    }
 
    //send status update via MQTT every xxx
    if(millis()-timer_update_state_count > timer_update_state) {
     //addLog_P(LOG_LEVEL_INFO, PSTR("Serial Timer triggerd."));
     timer_update_state_count=millis();
     send_values();
+    
+   }
+
+   //calculate hour values
+   if(millis()-timer_hour_count > timer_hour) {
+   
+    timer_hour_count=millis();
+    volume_h=volume_h_counter; //set current volume/hour variable for the next hour
+    volume_h_counter=0; //reset counter
+    
+    power=power_counter;
+    power_counter=0;
     
    }
    
