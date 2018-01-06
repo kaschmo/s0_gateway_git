@@ -14,33 +14,29 @@
  #include <ESP8266HTTPUpdateServer.h>
  //end OTA requirements
  #include <PubSubClient.h>
- #include <Adafruit_BME280.h>
- 
- 
- // An IR detector/demodulator is connected to GPIO pin 14 on Sonoff
- uint16_t IR_SEND_PIN = 14;
- uint16_t BME_SCL = 1;
- uint16_t BME_SDA = 3;
+
  
  //timer
  int timer_update_state_count;
  int timer_update_state = 60000; //update status via MQTT every minute
  
+ //pulse counting support
+ uint32_t pulseCount = 0;
+ uint32_t lastBlink = 0;
  
  //MQTT
  WiFiClient espClient;
  PubSubClient client(espClient);
  //all wifi credential and MQTT Server importet through wifi_credential.h
  
- const char* inTopic = "cmnd/ss_bath/#";
- const char* outTopic = "stat/ss_bath/";
- const char* mqtt_id = "ss_bath";
+ //sensor gateway is for heating counting
+ const char* inTopic = "cmnd/ss_heat/#";
+ const char* outTopic = "stat/ss_heat/";
+ const char* mqtt_id = "ss_heat";
  
- //BME280
- #define SEALEVELPRESSURE_HPA (1013.25)
- Adafruit_BME280 bme280; // I2C
- float bme280_temperature, bme280_pressure, bme280_humidity, bme280_height;
- float bme280_temp_offset = 1.5;
+ //Pins
+ uint16_t VOL_PIN=14; //GPIO14 = D5;
+ uint16_t Q_PIN=12; //GPIO15 = D6;
  
  //OTA
  ESP8266WebServer httpServer(80);
@@ -93,43 +89,44 @@
    
    
  
-   if (!strcmp(cmnd, "tset")) {
-     Serial.print("Received new temperature setpoint: ");
-     //dummy only.
+   if (!strcmp(cmnd, "status")) {
+     Serial.print("Received status reqeust. sending status");
+     send_status();
    }
+   if (!strcmp(cmnd, "reset")) {
+    Serial.print(F("Reset requested. Resetting..."));
+    //software_Reset();
+  }
  }
-   
+
+ void send_status()
+ {
+   char outTopic_status[50];
+   char msg[50];
+   //IP Address
+   strcpy(outTopic_status,outTopic);
+   strcat(outTopic_status,"ip_address");
+   //Arduino IP
+   //IPAddress ip=WiFi.localIP();
+   //sprintf(msg, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+   //ESP IP
+   WiFi.localIP().toString().toCharArray(msg,50);
+   client.publish(outTopic_status,msg ); 
+ }
  
- //send Sensor Values via MQTT
- void sendSensorValues(){
+ //send Values via MQTT
+ void send_values(){
     
     char outTopic_status[50];
     char msg[50];
  
     
    //roomtemp from BME280
-     strcpy(outTopic_status,outTopic);
+   /*  strcpy(outTopic_status,outTopic);
     dtostrf(bme280_temperature,2,2,msg); 
     strcat(outTopic_status,"temperature");
     client.publish(outTopic_status, msg);
- 
-   //BME280 Humidity
-    strcpy(outTopic_status,outTopic);
-    dtostrf(bme280_humidity,2,2,msg); 
-    strcat(outTopic_status,"humidity");
-    client.publish(outTopic_status, msg);
- 
-    //BME280 Pressure
-    strcpy(outTopic_status,outTopic);
-    dtostrf(bme280_pressure,2,2,msg); 
-    strcat(outTopic_status,"pressure");
-    client.publish(outTopic_status, msg);
- 
-     //IP Address
-    strcpy(outTopic_status,outTopic);
-    strcat(outTopic_status,"ip_address");
-    WiFi.localIP().toString().toCharArray(msg,50);
-    client.publish(outTopic_status,msg ); 
+ */
  
  }
  
@@ -142,10 +139,10 @@
      if (client.connect(mqtt_id)) {
        Serial.println("connected");
        
-       client.publish(outTopic, "ss_bath station booted");
+       client.publish(outTopic, "ss_heat station booted");
        
        //send current Status via MQTT to world
-       sendSensorValues();
+       send_status();
        // ... and resubscribe
        client.subscribe(inTopic);
  
@@ -158,12 +155,27 @@
    }
  }
  
- void update_sensors() {
-   bme280_temperature=bme280.readTemperature()-bme280_temp_offset; //C
-   bme280_pressure=bme280.readPressure() / 100.0F; //in hPA
-   bme280_humidity=bme280.readHumidity(); //%
-   bme280_height=bme280.readAltitude(SEALEVELPRESSURE_HPA); //m
- 
+ void update_values() {
+   //NEEDED?
+ }
+
+ //Interrupt Callback Function
+ void onPulse()
+ {
+    Serial.println("Interrupt");      
+    
+    // if (!SLEEP_MODE) {
+         uint32_t newBlink = micros();
+         uint32_t interval = newBlink-lastBlink;
+         if (interval<10000L) { // Sometimes we get interrupt on RISING
+             return;
+         }
+         //watt = (3600000000.0 /interval) / ppwh;
+         lastBlink = newBlink;
+     //}
+     pulseCount++;
+     Serial.println("Detected new pulse");      
+     
  }
  
  void setup() {
@@ -173,24 +185,17 @@
    //INIT TIMERS
    timer_update_state_count=millis();
  
-   //INIT BME280
-   //SDA, SCL
-   Wire.begin(BME_SDA, BME_SCL);
-   bool status;
-   status = bme280.begin();
-   if (!status) {
-       Serial.println("Could not find a valid BME280 sensor, check wiring!");
-       while (1);
-   }
-   update_sensors(); 
+   //interrupt for the S0 Pins
+   pinMode(VOL_PIN, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(VOL_PIN), onPulse, RISING);
+
+   update_values(); 
  
    //WIFI and MQTT
    setup_wifi();                   // Connect to wifi 
    client.setServer(mqtt_server, 1883);
    client.setCallback(callback);
- 
-  
- }
+}
  
  
  void loop() {
@@ -199,16 +204,16 @@
    }
    client.loop();
  
-   update_sensors(); 
+   update_values(); 
  
    //http Updater for OTA
    httpServer.handleClient(); 
  
-   //send status update via MQTT every minute
+   //send status update via MQTT every xxx
    if(millis()-timer_update_state_count > timer_update_state) {
     //addLog_P(LOG_LEVEL_INFO, PSTR("Serial Timer triggerd."));
     timer_update_state_count=millis();
-    sendSensorValues();
+    send_values();
     
    }
    
