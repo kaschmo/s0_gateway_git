@@ -4,6 +4,7 @@
  */
 
 #include "wifi_credentials.h"
+#include <EEPROM.h>
 
  //required for MQTT
  #include <ESP8266WiFi.h>
@@ -15,15 +16,24 @@
  //end OTA requirements
  #include <PubSubClient.h>
 
+ #define EEPROM_ADDRESS 0
  
+
  //timer
  int timer_update_state_count;
  int timer_update_state = 60000; //update status via MQTT every minute
  
  //pulse counting support
- uint32_t pulseCount = 0;
- uint32_t lastBlink = 0;
+ uint32_t pulse_count_V = 0;
+ uint32_t pulse_count_Q = 0;
+
+ //interrupt timer monitoring
+ uint32_t last_int_V = 0;
+ uint32_t last_int_Q = 0;
  
+uint32_t energy; // in kwh
+uint32_t volume; // in l
+
  //MQTT
  WiFiClient espClient;
  PubSubClient client(espClient);
@@ -93,9 +103,30 @@
      Serial.print("Received status reqeust. sending status");
      send_status();
    }
-   if (!strcmp(cmnd, "reset")) {
+   else if (!strcmp(cmnd, "reset")) {
     Serial.print(F("Reset requested. Resetting..."));
     //software_Reset();
+  }
+  else if (!strcmp(cmnd, "setV")) {
+    Serial.print("Received new volume baseline: ");
+    unsigned int v;
+    //get code from message
+    v=message.toInt();
+    Serial.println(v);
+    //store in EEPROM and set global var
+    EEPROM.put(EEPROM_ADDRESS, volume);
+    EEPROM.commit();
+    volume=v;
+  }
+  else if (!strcmp(cmnd, "setQ")) {
+    Serial.print("Received new energy baseline: ");
+    unsigned int q;
+    //get code from message
+    q=message.toInt();
+    Serial.println(q);
+    //store in EEPROM and set global var
+    //EEPROM.put(EEPROM_ADDRESS, code);
+    energy=q;
   }
  }
 
@@ -120,13 +151,15 @@
     char outTopic_status[50];
     char msg[50];
  
-    
-   //roomtemp from BME280
-   /*  strcpy(outTopic_status,outTopic);
-    dtostrf(bme280_temperature,2,2,msg); 
-    strcat(outTopic_status,"temperature");
+    strcpy(outTopic_status,outTopic);
+    dtostrf(energy,2,2,msg); 
+    strcat(outTopic_status,"energy");
     client.publish(outTopic_status, msg);
- */
+
+    strcpy(outTopic_status,outTopic);
+    dtostrf(volume,2,2,msg); 
+    strcat(outTopic_status,"volume");
+    client.publish(outTopic_status, msg);
  
  }
  
@@ -154,28 +187,26 @@
      }
    }
  }
- 
- void update_values() {
-   //NEEDED?
- }
 
  //Interrupt Callback Function
- void onPulse()
- {
+ void on_pulse()
+ { 
     Serial.println("Interrupt");      
     
     // if (!SLEEP_MODE) {
-         uint32_t newBlink = micros();
-         uint32_t interval = newBlink-lastBlink;
+         uint32_t new_int = micros();
+         uint32_t interval = new_int-last_int_V;
          if (interval<10000L) { // Sometimes we get interrupt on RISING
              return;
          }
          //watt = (3600000000.0 /interval) / ppwh;
-         lastBlink = newBlink;
+         last_int_V = new_int;
      //}
-     pulseCount++;
-     Serial.println("Detected new pulse");      
-     
+     pulse_count_V++;
+     Serial.print("Detected new pulse. Count: ");      
+     Serial.print(pulse_count_V);
+     Serial.print(" Interval: ");
+     Serial.println(interval);
  }
  
  void setup() {
@@ -185,11 +216,14 @@
    //INIT TIMERS
    timer_update_state_count=millis();
  
-   //interrupt for the S0 Pins
-   pinMode(VOL_PIN, INPUT_PULLUP);
-   attachInterrupt(digitalPinToInterrupt(VOL_PIN), onPulse, RISING);
+    //EEPROM
+    EEPROM.begin(512); //added 
+    EEPROM.get(EEPROM_ADDRESS, volume);
+    Serial.print("Fetched volume from EEPROM : "); Serial.println(volume);
 
-   update_values(); 
+   //interrupt for the S0 Pins
+   pinMode(VOL_PIN, INPUT);
+   attachInterrupt(digitalPinToInterrupt(VOL_PIN), on_pulse, RISING);
  
    //WIFI and MQTT
    setup_wifi();                   // Connect to wifi 
@@ -203,12 +237,22 @@
      reconnect();
    }
    client.loop();
- 
-   update_values(); 
- 
+  
    //http Updater for OTA
    httpServer.handleClient(); 
  
+   //calculate new V and Q
+   if (pulse_count_V>0) {
+    
+    volume+=pulse_count_V; //1 pulse = 1l = 0.001m3
+    EEPROM.put(EEPROM_ADDRESS, volume); 
+    EEPROM.commit();     
+    pulse_count_V=0; //resetting pulse count. ATTENTIOn: this could create race condition. maybe use separate variable
+    Serial.print("Volume: ");
+    Serial.println(volume);
+}
+
+
    //send status update via MQTT every xxx
    if(millis()-timer_update_state_count > timer_update_state) {
     //addLog_P(LOG_LEVEL_INFO, PSTR("Serial Timer triggerd."));
